@@ -3,11 +3,11 @@ from paddlex import create_pipeline
 pipeline = create_pipeline(pipeline="PP-StructureV3")
 
 output = pipeline.predict(
-    input="./example.png",
+    input="./example_1.png",
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
     use_textline_orientation=False,
-    use_table_recognition=True,
+    use_table_recognition=False,
 )
 for res in output:
     res.print() ## 打印预测的结构化输出
