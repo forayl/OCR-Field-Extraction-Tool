@@ -7,9 +7,34 @@ import shutil
 import subprocess
 import threading
 import time
+import sys
+import traceback
 from PIL import Image, ImageTk, ImageFilter
 from PIL.Image import Resampling
-from paddlex import create_pipeline
+import cv2
+import numpy as np
+from datetime import datetime
+
+# 资源文件路径处理函数
+def resource_path(relative_path):
+    """获取资源的绝对路径，兼容开发环境和PyInstaller打包后的环境"""
+    try:
+        # PyInstaller创建临时文件夹，将路径存储在_MEIPASS中
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    
+    return os.path.join(base_path, relative_path)
+
+# 设置PaddleOCR模型保存目录
+models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+if not os.path.exists(models_dir):
+    os.makedirs(models_dir, exist_ok=True)
+os.environ["PADDLE_OCR_BASE_DIR"] = models_dir
+print(f"已设置OCR模型目录: {models_dir}")
+
+# 不要在全局范围导入PaddleOCR
+# from paddleocr import PaddleOCR
 
 
 class OCRExtractionApp:
@@ -22,10 +47,12 @@ class OCRExtractionApp:
         self.ocr_data = None
         self.extracted_data = {}
         self.image_path = None
-        self.output_dir = "./output"
+        # 使用用户主目录下的路径，而不是相对路径
+        self.output_dir = os.path.join(os.path.expanduser("~"), "Glory_OCR_Output")
         self.ocr_result_image = None
         self.ocr_thread = None
         self.is_processing = False
+        self.ocr_model = None
         
         # 图片显示相关变量
         self.current_display_image = None
@@ -37,6 +64,31 @@ class OCRExtractionApp:
             os.makedirs(self.output_dir)
         
         self.create_ui()
+    
+    def init_ocr_model(self):
+        """惰性初始化OCR模型，仅在需要时加载"""
+        if self.ocr_model is None:
+            try:
+                # 显示加载信息
+                self.text_output.insert(tk.END, "正在加载OCR模型，请稍候...\n")
+                self.text_output.update()
+                
+                # 在这里导入paddle和PaddleOCR
+                import paddle
+                paddle.set_device('cpu')
+                from paddleocr import PaddleOCR
+                
+                # 初始化模型
+                self.ocr_model = PaddleOCR(use_angle_cls=False, lang="en")
+                self.text_output.insert(tk.END, "模型加载完成\n")
+                return True
+            except Exception as e:
+                error_msg = f"加载OCR模型失败: {str(e)}\n"
+                self.text_output.insert(tk.END, error_msg)
+                traceback.print_exc()
+                messagebox.showerror("错误", error_msg)
+                return False
+        return True
     
     def create_ui(self):
         # 创建主框架
@@ -77,6 +129,18 @@ class OCRExtractionApp:
         # 状态信息
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(image_frame, textvariable=self.status_var).pack(anchor=tk.W, pady=5)
+        
+        # 添加文本输出区域
+        output_frame = ttk.LabelFrame(image_frame, text="处理日志")
+        output_frame.pack(fill=tk.X, pady=5, before=self.progress_bar)
+        
+        # 创建文本控件和滚动条
+        self.text_output = tk.Text(output_frame, height=5, width=50)
+        self.text_output.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        scrollbar = ttk.Scrollbar(output_frame, orient=tk.VERTICAL, command=self.text_output.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_output['yscrollcommand'] = scrollbar.set
         
         # 图片显示区域
         image_display_frame = ttk.Frame(image_frame)
@@ -346,62 +410,108 @@ class OCRExtractionApp:
             self.root.after(200, self.update_progress)
     
     def run_ocr_process(self):
-        """运行OCR处理过程（在单独的线程中）"""
+        """运行OCR处理流程"""
         try:
-            # 准备输入和输出文件路径
-            input_img = self.image_path
-            filename = os.path.basename(input_img)
-            filename_noext = os.path.splitext(filename)[0]
+            # 检查文件是否存在
+            if not os.path.exists(self.image_path):
+                messagebox.showerror("错误", f"文件不存在: {self.image_path}")
+                return
+
+            # 读取图像文件
+            image = cv2.imread(self.image_path)
+            if image is None:
+                messagebox.showerror("错误", f"无法读取图像: {self.image_path}")
+                return
+
+            # 添加输出内容
+            self.text_output.delete(1.0, tk.END)
+            self.text_output.insert(tk.END, f"正在处理图像: {self.image_path}\n")
+
+            # 设置OCR信息
+            self.ocr_data = {}
+            self.extracted_data = {}
             
-            # 创建OCR Pipeline
-            pipeline = create_pipeline(pipeline="OCR.yaml")
-            
+            # 初始化OCR模型
+            if not self.init_ocr_model():
+                self.is_processing = False
+                self.status_var.set("OCR模型加载失败")
+                return
+
             # 运行OCR识别
-            output = pipeline.predict(
-                input=input_img,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
+            result = self.ocr_model.ocr(image, cls=True)
             
-            # 保存结果
-            for res in output:
-                res.save_to_json(save_path=self.output_dir)  # 保存JSON结果
-                res.save_to_img(save_path=self.output_dir)   # 保存图像结果
+            if not result or len(result) == 0 or len(result[0]) == 0:
+                self.text_output.insert(tk.END, "未检测到任何文本\n")
+                return
+                
+            dt_boxes = []
+            rec_res = []
             
-            # 检查输出的JSON文件
-            ocr_result_json = os.path.join(self.output_dir, f"{filename_noext}_res.json")
-            ocr_result_image = os.path.join(self.output_dir, f"{filename_noext}_overall_ocr_res.png")
+            # 提取检测框和识别结果
+            for line in result[0]:
+                dt_boxes.append(np.array(line[0]))
+                rec_res.append(line[1])
+                
+            texts = [text[0] for text in rec_res]
+            scores = [text[1] for text in rec_res]
             
-            if os.path.exists(ocr_result_json):
-                # 设置进度条为100%
-                self.progress_var.set(100)
-                
-                # 保存OCR结果图片路径
-                if os.path.exists(ocr_result_image):
-                    self.ocr_result_image = ocr_result_image
-                
-                # 加载OCR结果并提取字段
-                with open(ocr_result_json, 'r', encoding='utf-8') as f:
-                    self.ocr_data = json.load(f)
-                
-                # 提取字段
-                self.extract_recipe()
-                self.extract_badge_number()
-                self.extract_table_data()
-                
-                # 在主线程中更新UI
-                self.root.after(0, self.update_ui_after_ocr)
-            else:
-                self.root.after(0, lambda: messagebox.showerror("Error", "OCR处理失败，未生成结果文件"))
-                self.root.after(0, lambda: self.status_var.set("OCR处理失败"))
-        
+            # 将四点坐标转换为矩形边界框格式 [x_min, y_min, x_max, y_max]
+            rect_boxes = []
+            for box in dt_boxes:
+                x_min = min(box[:, 0])
+                y_min = min(box[:, 1])
+                x_max = max(box[:, 0])
+                y_max = max(box[:, 1])
+                rect_boxes.append([x_min, y_min, x_max, y_max])
+            
+            # 保存OCR结果
+            self.ocr_data = {
+                'image_path': self.image_path,
+                'image_size': image.shape,
+                'rec_texts': texts,
+                'rec_scores': scores,
+                'rec_boxes': rect_boxes  # 使用转换后的矩形边界框
+            }
+            
+            # 提取数据
+            self.extract_all_data()
+            
+            # 显示结果
+            self.show_results()
+            
+            # 添加日志输出
+            self.text_output.insert(tk.END, "OCR处理完成\n")
+            
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Error", f"OCR处理发生错误: {str(e)}"))
-            self.root.after(0, lambda: self.status_var.set("OCR处理发生错误"))
-        
-        finally:
+            error_message = f"OCR处理出错: {str(e)}"
+            self.text_output.insert(tk.END, error_message + "\n")
+            traceback.print_exc()
+            messagebox.showerror("错误", error_message)
+    
+    def show_results(self):
+        """显示OCR结果并更新UI"""
+        try:
+            # 更新进度
+            self.progress_var.set(100)
+            
+            # 设置处理状态
             self.is_processing = False
+            self.status_var.set("OCR处理完成")
+            
+            # 更新UI中的数据显示
+            self.update_ui()
+            
+            # 显示OCR结果图像
+            if self.ocr_result_image and os.path.exists(self.ocr_result_image):
+                self.show_image("ocr_result")
+            
+            # 日志输出
+            self.text_output.insert(tk.END, "结果显示完成\n")
+            
+        except Exception as e:
+            error_message = f"显示结果时发生错误: {str(e)}"
+            self.text_output.insert(tk.END, error_message + "\n")
+            traceback.print_exc()
     
     def update_ui_after_ocr(self):
         """在OCR完成后更新UI"""
@@ -437,7 +547,12 @@ class OCRExtractionApp:
                 # 查找位于Recipe值位置附近的文本
                 for i, (text, box) in enumerate(zip(texts, boxes)):
                     if box and len(box) == 4:
-                        x_min, y_min, x_max, y_max = box
+                        # 边界框已经是[x_min, y_min, x_max, y_max]格式
+                        x_min = box[0]
+                        y_min = box[1]
+                        x_max = box[2]
+                        y_max = box[3]
+                        
                         # 检查位置是否接近[193, 71, 297, 95]
                         if (190 <= x_min <= 200 and 65 <= y_min <= 75 and 
                             240 <= x_max <= 280 and 90 <= y_max <= 100):
@@ -465,7 +580,9 @@ class OCRExtractionApp:
                         recipe_index = i
                         print(f"找到Recipe标签，索引: {recipe_index}")
                         if i+1 < len(texts) and len(boxes) > i+1:
-                            if 180 <= boxes[i+1][0] <= 200:  # 检查下一个文本是否在正确位置
+                            # 获取标签右侧文本的x坐标
+                            x_min = boxes[i+1][0]  # 矩形边界框的x_min位于索引0
+                            if 180 <= x_min <= 200:  # 检查下一个文本是否在正确位置
                                 recipe_val = texts[i+1]
                                 print(f"通过标签找到Recipe值: {recipe_val}")
                                 self.extracted_data['recipe'] = recipe_val
@@ -492,7 +609,12 @@ class OCRExtractionApp:
                 # 查找位于BadgeNo.值位置附近的文本
                 for i, (text, box) in enumerate(zip(texts, boxes)):
                     if box and len(box) == 4:
-                        x_min, y_min, x_max, y_max = box
+                        # 边界框已经是[x_min, y_min, x_max, y_max]格式
+                        x_min = box[0]
+                        y_min = box[1]
+                        x_max = box[2]
+                        y_max = box[3]
+                        
                         # 检查位置是否接近[192,110,345,132]
                         if (185 <= x_min <= 200 and 105 <= y_min <= 115 and 
                             340 <= x_max <= 350 and 125 <= y_max <= 135):
@@ -543,7 +665,7 @@ class OCRExtractionApp:
                 # 定义表格列的精确坐标范围
                 min_col_range = {
                     'x_min': (998, 1002),
-                    'x_max': (1035, 1039),
+                    'x_max': (1030, 1039),
                     'y_min': (214, 335),
                     'y_max': (236, 354)
                 }
@@ -552,14 +674,14 @@ class OCRExtractionApp:
                     'x_min': (1047, 1056),
                     'x_max': (1080, 1090),
                     'y_min': (213, 333),
-                    'y_max': (238, 356)
+                    'y_max': (230, 356)
                 }
                 
                 count_col_range = {
                     'x_min': (1119, 1131),
                     'x_max': (1139, 1149),
                     'y_min': (214, 335),
-                    'y_max': (235, 355)
+                    'y_max': (230, 355)
                 }
                 
                 # 查找表格中的所有值（基于精确的坐标范围）
@@ -572,7 +694,11 @@ class OCRExtractionApp:
                     if not box or len(box) != 4:
                         continue
                         
-                    x_min, y_min, x_max, y_max = box
+                    # 直接使用边界框，因为已经是[x_min, y_min, x_max, y_max]格式
+                    x_min = box[0]
+                    y_min = box[1]
+                    x_max = box[2]
+                    y_max = box[3]
                     
                     # 检查是否在Min列范围内
                     if (min_col_range['x_min'][0] <= x_min <= min_col_range['x_min'][1] and
@@ -719,6 +845,98 @@ class OCRExtractionApp:
             {"min": "3.000", "max": "Max", "count": "1"}
         ]
     
+    def extract_all_data(self):
+        """提取所有字段数据，包括Recipe、BadgeNo.和表格数据"""
+        try:
+            self.text_output.insert(tk.END, "开始提取数据字段...\n")
+            
+            # 提取Recipe值
+            self.extract_recipe()
+            self.text_output.insert(tk.END, f"提取Recipe: {self.extracted_data.get('recipe', '未找到')}\n")
+            
+            # 提取BadgeNo.值
+            self.extract_badge_number()
+            self.text_output.insert(tk.END, f"提取BadgeNo.: {self.extracted_data.get('badge_number', '未找到')}\n")
+            
+            # 提取Time值（如果有实现此方法）
+            if hasattr(self, 'extract_time') and callable(getattr(self, 'extract_time')):
+                self.extract_time()
+                self.text_output.insert(tk.END, f"提取Time: {self.extracted_data.get('time', '未找到')}\n")
+            
+            # 提取表格数据
+            self.extract_table_data()
+            self.text_output.insert(tk.END, f"提取表格数据: {len(self.extracted_data.get('table', []))}行\n")
+            
+            # 生成OCR结果图像
+            self.generate_ocr_result_image()
+            
+            # 更新UI
+            self.root.after(0, self.update_ui_after_ocr)
+            
+        except Exception as e:
+            error_message = f"提取数据时发生错误: {str(e)}"
+            self.text_output.insert(tk.END, error_message + "\n")
+            traceback.print_exc()
+            messagebox.showerror("错误", error_message)
+    
+    def generate_ocr_result_image(self):
+        """生成OCR结果图像，显示检测到的文本框和识别的文字"""
+        try:
+            if not self.ocr_data or not self.image_path:
+                return
+            
+            # 读取原始图像
+            image = cv2.imread(self.image_path)
+            if image is None:
+                print(f"无法读取图像文件: {self.image_path}")
+                return
+            
+            # 创建图像副本
+            result_image = image.copy()
+            
+            # 获取OCR结果
+            texts = self.ocr_data.get('rec_texts', [])
+            boxes = self.ocr_data.get('rec_boxes', [])
+            
+            # 在图像上绘制检测框和文本
+            for text, box in zip(texts, boxes):
+                if box and len(box) == 4:
+                    # 使用矩形边界框 [x_min, y_min, x_max, y_max]
+                    x_min, y_min, x_max, y_max = map(int, box)
+                    
+                    # 绘制矩形框
+                    cv2.rectangle(result_image, (x_min, y_min), (x_max, y_max), (0, 0, 255), 2)
+                    
+                    # 设置文字显示位置和参数
+                    text_position = (x_min, y_min - 10)
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.5
+                    font_thickness = 1
+                    
+                    # 绘制文字底色（提高可读性）
+                    text_size, _ = cv2.getTextSize(text, font, font_scale, font_thickness)
+                    cv2.rectangle(result_image, 
+                                 (text_position[0], text_position[1] - text_size[1]),
+                                 (text_position[0] + text_size[0], text_position[1] + 5),
+                                 (255, 255, 255), -1)
+                    
+                    # 显示文字
+                    cv2.putText(result_image, text, text_position, font, font_scale, (0, 0, 255), font_thickness)
+            
+            # 保存结果图像
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            filename = f"ocr_result_{timestamp}.jpg"
+            output_path = os.path.join(self.output_dir, filename)
+            cv2.imwrite(output_path, result_image)
+            
+            # 保存路径用于显示
+            self.ocr_result_image = output_path
+            self.text_output.insert(tk.END, f"OCR结果图像已保存: {output_path}\n")
+            
+        except Exception as e:
+            print(f"生成OCR结果图像时出错: {str(e)}")
+            traceback.print_exc()
+    
     def edit_table_data(self):
         """打开一个编辑窗口让用户手动修改表格数据"""
         if not self.extracted_data or 'table' not in self.extracted_data:
@@ -829,8 +1047,114 @@ class OCRExtractionApp:
             except Exception as e:
                 messagebox.showerror("Error", f"导出结果时发生错误: {str(e)}")
 
+    def convert_to_rect_box(self, quad_box):
+        """将四点坐标转换为矩形边界框格式 [x_min, y_min, x_max, y_max]"""
+        points = np.array(quad_box)
+        x_min = np.min(points[:, 0])
+        y_min = np.min(points[:, 1])
+        x_max = np.max(points[:, 0])
+        y_max = np.max(points[:, 1])
+        return [x_min, y_min, x_max, y_max]
+
+    def extract_time(self):
+        """提取Time字段值"""
+        try:
+            # 使用坐标位置查找Time值
+            if self.ocr_data:
+                texts = self.ocr_data.get('rec_texts', [])
+                boxes = self.ocr_data.get('rec_boxes', [])
+                
+                # Time字段值的位置约为[150, 40, 270, 60]
+                time_val = ""
+                
+                # 查找位于Time值位置附近的文本
+                for i, (text, box) in enumerate(zip(texts, boxes)):
+                    if box and len(box) == 4:  
+                        # 边界框已经是[x_min, y_min, x_max, y_max]格式
+                        x_min = box[0]
+                        y_min = box[1]
+                        x_max = box[2] 
+                        y_max = box[3]
+                        
+                        # 检查是否是看起来像时间的文本（包含:的文本）
+                        if ":" in text and 130 <= x_min <= 170 and 30 <= y_min <= 50:
+                            time_val = text
+                            print(f"找到Time值: {text}, 位置: {box}")
+                            break
+                
+                # 如果找到了值，保存它
+                if time_val:
+                    self.extracted_data['time'] = time_val
+                    return
+                
+                # 备选方法：查找Time标签，然后获取附近的文本
+                time_index = -1
+                for i, text in enumerate(texts):
+                    if text == "Time":
+                        time_index = i
+                        print(f"找到Time标签，索引: {time_index}")
+                        if i+1 < len(texts) and len(boxes) > i+1:
+                            # 获取可能的时间值
+                            next_text = texts[i+1]
+                            if ":" in next_text:
+                                time_val = next_text
+                                print(f"通过标签找到Time值: {time_val}")
+                                self.extracted_data['time'] = time_val
+                                return
+            
+            # 未找到，设为固定值
+            current_time = datetime.now().strftime("%H:%M")
+            self.extracted_data['time'] = current_time
+            print(f"无法找到Time值，使用当前时间: {current_time}")
+        except Exception as e:
+            print(f"提取Time时发生错误: {str(e)}")
+            current_time = datetime.now().strftime("%H:%M")
+            self.extracted_data['time'] = current_time
+
+
+def create_standalone_app():
+    """创建一个不依赖PaddleOCR的独立应用，用于显示错误信息"""
+    root = tk.Tk()
+    root.title("Glory OCR Demo - 错误")
+    root.geometry("600x400")
+    
+    frame = ttk.Frame(root, padding="20")
+    frame.pack(fill=tk.BOTH, expand=True)
+    
+    ttk.Label(frame, text="无法加载OCR模型", font=("Arial", 16, "bold")).pack(pady=10)
+    
+    error_text = tk.Text(frame, height=10, wrap=tk.WORD)
+    error_text.pack(fill=tk.BOTH, expand=True, pady=10)
+    error_text.insert(tk.END, "应用程序运行出错，可能是由于以下原因：\n\n")
+    error_text.insert(tk.END, "1. OCR模型文件缺失或损坏\n")
+    error_text.insert(tk.END, "2. 打包过程中缺少必要的依赖项\n")
+    error_text.insert(tk.END, "3. Python环境配置问题\n\n")
+    error_text.config(state="disabled")
+    
+    ttk.Button(frame, text="退出", command=root.destroy).pack(pady=10)
+    
+    return root
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = OCRExtractionApp(root)
-    root.mainloop() 
+    try:
+        # 尝试导入paddle，测试是否能正常工作
+        import paddle
+        paddle.set_device('cpu')
+        
+        # 如果导入成功，启动完整应用
+        root = tk.Tk()
+        app = OCRExtractionApp(root)
+        root.mainloop()
+    except ImportError as e:
+        # 导入失败，启动独立应用
+        print(f"导入错误: {str(e)}")
+        traceback.print_exc()
+        root = create_standalone_app()
+        root.mainloop()
+    except Exception as e:
+        # 其他错误
+        print(f"应用启动错误: {str(e)}")
+        traceback.print_exc()
+        messagebox.showerror("启动错误", f"应用程序启动时发生错误:\n{str(e)}")
+        sys.exit(1) 

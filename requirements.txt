@@ -1,4 +1,14 @@
+# 主索引使用 Paddle 的稳定 CPU 包源
+-i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+# 备用源（用于非 Paddle 相关包）
+--extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# Paddle 系列依赖
+paddlepaddle==3.0.0rc0
+paddlex==3.0rc0
+paddleocr
+
+# 通用依赖
 pillow>=9.0.0
-paddlex>=2.1.0
 pyinstaller>=5.6.0
-tkinter 
